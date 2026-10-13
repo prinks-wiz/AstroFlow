@@ -19,8 +19,9 @@ All three will sit behind the same interface and return the same kind of result 
 | Step | What | Status |
 |---|---|---|
 | 1 | Orbit dynamics: how a satellite moves under gravity | **Done** |
-| 2 | Camera, satellite pointing, Earth rotation, and the pixel prediction model | Next |
-| 3 | Simulator: fake flights with adjustable noise and bad matches | |
+| 2 | Camera, satellite pointing, Earth rotation, and the pixel prediction model | **Done** |
+| 3 | Simulator: fake flights with adjustable noise, bad matches, and camera exposure / white balance | **Done** |
+| 3b | Plots: 3D orbit, animation, ground track, pixel tracks | **Done** |
 | 4 | Batch least squares and a rough starting guess | |
 | 5 | First experiment: how accuracy changes with the number of matches and the share of bad ones | |
 | 6 | Particle filter | |
@@ -61,6 +62,57 @@ The tests in [tests/dynamics/](tests/dynamics/) check the dynamics against indep
 - Earth's bulge makes the orbit's plane slowly rotate. The measured rate matches the textbook formula to within 2%, including the sun-synchronous orbit case.
 - Results agree with [Brahe](https://github.com/duncaneddy/brahe), an established astrodynamics library, to a few hundredths of a millimeter after three orbits.
 
+## What's built: the simulator
+
+It produces what a landmark-matching camera would hand to an estimator: for each frame, pixel
+coordinates plus the matched landmark's position on Earth, with an uncertainty per point. The
+truth is kept on the side so results can be scored.
+
+```python
+from astroflow.sim import SimConfig, Simulator
+
+data = Simulator(SimConfig(inliers_per_frame=25, outlier_fraction=0.2, pixel_sigma=0.5, seed=1)).generate()
+data.obs           # t, pixels, landmark_ecef, sigma_px  <- all an estimator gets to see
+data.is_outlier    # which matches are wrong             <- for scoring only
+```
+
+Knobs: orbit, number and spacing of frames, inliers per frame, outlier fraction and type
+(random pixel, or a landmark that is close but wrong), pixel noise, landmark position error,
+per-point confidence, camera, pointing, and the seed (same seed gives identical data).
+
+The pieces, all in [src/astroflow/](src/astroflow/):
+
+- `frames.py`, `geodesy.py`: Earth rotation, WGS84 coordinates, horizon and ray-casting.
+- `camera.py`, `attitude.py`: pinhole camera (default 1920x1080, 60 degree field of view),
+  nadir-pointing or known-attitude pointing.
+- `measurement.py`: predicts pixels and how they change with the orbit state. The same code
+  makes the simulated data and will be the estimators' model, so the two cannot disagree.
+- `sensor.py`: **camera settings** (exposure, gain, white balance) and their effect on match quality.
+- `sim/`: the simulator and the outlier generators.
+
+### Camera settings: read this before trusting the numbers
+
+Exposure and white balance are modelled in two parts. Motion blur is plain geometry (how far the
+ground slides during the exposure). The rest, such as how brightness, noise, saturation and a
+white-balance mismatch change detection and outlier rates, is an **assumed model with adjustable
+coefficients, not measured Arducam behaviour**. The camera itself is a generic placeholder until
+the real unit's specs are known. A later stage will replace the assumed part with rendered images.
+
+## Plots
+
+```bash
+pip install -e ".[viz]"
+python examples/simulate_demo.py     # writes HTML and PNG files to out/
+```
+
+| File | Shows |
+|---|---|
+| `orbit_3d.html` | The orbit around the Earth (drag to rotate) |
+| `orbit_animation.html` | The satellite moving, Earth rotating, and the camera footprint |
+| `ground_track.html` | Track on a world map, footprints, matched landmarks (inliers teal, outliers red) |
+| `pixel_tracks.html` | Where matches land in the image; drag to highlight points |
+| `camera_settings.html` | How exposure, gain and white balance change match quality (under the assumed model) |
+
 ## Getting started
 
 You need Python 3.10 or newer.
@@ -68,7 +120,7 @@ You need Python 3.10 or newer.
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev,brahe]"   # drop ",brahe" to skip the Brahe cross-check
+pip install -e ".[dev,brahe,viz]"   # drop "brahe" / "viz" if you do not need them
 
 pytest                           # run the tests
 python examples/propagate_demo.py
@@ -79,8 +131,11 @@ python examples/propagate_demo.py
 ```
 src/astroflow/
     constants.py        Earth constants
-    dynamics/           orbit dynamics (see above)
-tests/dynamics/         tests for the dynamics
+    dynamics/           orbit dynamics
+    frames.py geodesy.py camera.py attitude.py measurement.py sensor.py illumination.py errors.py
+    sim/                the simulator
+    viz/                plots
+tests/                  tests for everything above
 examples/               small runnable demos
 ```
 

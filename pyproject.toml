@@ -12,9 +12,13 @@ dependencies = ["numpy", "scipy"]
 [project.optional-dependencies]
 dev = ["pytest"]
 brahe = ["brahe"]
+viz = ["altair", "plotly", "pandas", "vl-convert-python"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+astroflow = ["viz/data/*.json"]
