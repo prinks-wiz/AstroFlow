@@ -1,97 +1,147 @@
-"""Interactive 3D orbit views (Plotly): static plot and an animation with the Earth rotating."""
+"""3D orbit views without WebGL.
+
+Altair has no 3D marks, so the orthographic projection is done in the chart (Vega expressions)
+and re-evaluated as the azimuth / elevation sliders move. Everything is drawn as ordinary 2D
+vector graphics, so it works in browsers and environments without WebGL.
+
+Earth is a disc (an orthographic view of a sphere is always a circle); anything that lies
+behind it from the current viewpoint is hidden.
+"""
 from __future__ import annotations
 
+import altair as alt
 import numpy as np
-import plotly.graph_objects as go
+import pandas as pd
 
-from ._data import dense_track, ellipsoid_mesh, footprint_ecef, graticule_ecef
+from ..constants import R_EARTH
+from ..dynamics import Propagator
+from ._data import dense_track, footprint_ecef, graticule_ecef
 
-_EARTH_COLORS = [[0, "#1d3b53"], [1, "#2d5a7b"]]
+KM = 1e-3
+SIZE_PX = 640
+_BG = "#0b1620"
 
-
-def _scene(fig, title):
-    fig.update_layout(
-        title=title, margin=dict(l=0, r=0, t=40, b=0), legend=dict(orientation="h"),
-        scene=dict(aspectmode="data", xaxis_title="x ECI (m)", yaxis_title="y ECI (m)", zaxis_title="z ECI (m)"))
-
-
-def _earth_trace():
-    x, y, z = ellipsoid_mesh()
-    return go.Surface(x=x, y=y, z=z, colorscale=_EARTH_COLORS, showscale=False, opacity=1.0,
-                      hoverinfo="skip", name="Earth", lighting=dict(ambient=0.8, diffuse=0.4))
-
-
-def _graticule_xyz(earth, t):
-    """Graticule rotated into ECI at time t, as one NaN-separated polyline."""
-    R_ie = earth.rotation(t).T
-    xs, ys, zs = [], [], []
-    for line in graticule_ecef():
-        p = line @ R_ie.T
-        xs += list(p[:, 0]) + [np.nan]; ys += list(p[:, 1]) + [np.nan]; zs += list(p[:, 2]) + [np.nan]
-    return xs, ys, zs
+# screen axes for azimuth az, elevation el (degrees): u right, v up, d toward the viewer
+_RAD = "PI/180"
+_U = f"-sin(az*{_RAD})*datum.x + cos(az*{_RAD})*datum.y"
+_V = (f"-sin(el*{_RAD})*cos(az*{_RAD})*datum.x - sin(el*{_RAD})*sin(az*{_RAD})*datum.y"
+      f" + cos(el*{_RAD})*datum.z")
+_D = (f"cos(el*{_RAD})*cos(az*{_RAD})*datum.x + cos(el*{_RAD})*sin(az*{_RAD})*datum.y"
+      f" + sin(el*{_RAD})*datum.z")
 
 
-def plot_orbit_3d(data, n_dense: int = 400) -> go.Figure:
-    """Earth, the true orbit over the observed arc, and the satellite at each frame time."""
+def _rot_angle(earth, t: float) -> float:
+    R = earth.rotation(t)
+    return float(np.arctan2(R[0, 1], R[0, 0]))  # ECI->ECEF rotation about z
+
+
+def _default_view(data, el: float = 20.0, off_normal_deg: float = 55.0):
+    """Azimuth/elevation that looks at the orbit plane obliquely (not edge-on, not face-on),
+    so the orbit's inclination and the near/far sides are visible."""
+    n = np.cross(data.truth_x_epoch[:3], data.truth_x_epoch[3:])
+    n /= np.linalg.norm(n)
+    best = None
+    for az in np.arange(-180, 180, 5.0):
+        a, e = np.radians(az), np.radians(el)
+        c = np.array([np.cos(e) * np.cos(a), np.cos(e) * np.sin(a), np.sin(e)])
+        err = abs(np.degrees(np.arccos(np.clip(abs(c @ n), 0, 1))) - off_normal_deg)
+        if best is None or err < best[0]:
+            best = (err, az)
+    return best[1], el
+
+
+def _project(chart: alt.Chart, rotate_grid: str | None = None, hide_behind_earth: bool = True) -> alt.Chart:
+    """Add the projection transforms (and optionally rotate points about z first)."""
+    c = chart
+    if rotate_grid:
+        c = (c.transform_calculate(x=f"datum.gx*cos({rotate_grid}) - datum.gy*sin({rotate_grid})",
+                                   y=f"datum.gx*sin({rotate_grid}) + datum.gy*cos({rotate_grid})",
+                                   z="datum.gz"))
+    c = c.transform_calculate(u=_U, v=_V, d=_D)
+    if hide_behind_earth:
+        c = c.transform_filter(f"!(datum.d < 0 && datum.u*datum.u + datum.v*datum.v < {(R_EARTH * KM) ** 2})")
+    return c
+
+
+def _build(data, animated: bool, n_dense: int, n_time: int) -> alt.LayerChart:
     cfg = data.config
+    L = 1.25 * max(np.linalg.norm(data.truth_states[:, :3], axis=1).max(), R_EARTH) * KM
+    xy = dict(
+        x=alt.X("u:Q", scale=alt.Scale(domain=[-L, L]), axis=None),
+        y=alt.Y("v:Q", scale=alt.Scale(domain=[-L, L]), axis=None))
+
+    # --- view and time controls
+    az0, el0 = _default_view(data)
+    az = alt.param(name="az", value=az0, bind=alt.binding_range(min=-180, max=180, step=1, name="azimuth (deg) "))
+    el = alt.param(name="el", value=el0, bind=alt.binding_range(min=-90, max=90, step=1, name="elevation (deg) "))
+    params = [az, el]
+
+    # --- Earth disc: radius in px = R * (SIZE_PX / 2L); a circle symbol's size is the area of its bounding square, so r = sqrt(size)/2
+    r_px = R_EARTH * KM * SIZE_PX / (2 * L)
+    earth = alt.Chart(pd.DataFrame(dict(u=[0.0], v=[0.0]))).mark_circle(
+        size=float((2 * r_px) ** 2), color="#1d4f73", opacity=1.0).encode(**xy)
+
+    # --- lat/lon grid, rotating with the Earth when animated
+    th0 = _rot_angle(cfg.earth, 0.0)
+    t_end = float(max(data.frame_times[-1], 1.0))
+    dt = t_end / (n_time - 1)
+    rate = (_rot_angle(cfg.earth, dt) - th0) / dt
+    # ECI->ECEF angle th means ECEF->ECI rotates by -th; use the inverse sign here
+    grid_rows = []
+    for i, line in enumerate(graticule_ecef(30, 90)):
+        grid_rows.append(pd.DataFrame(dict(gx=line[:, 0] * KM, gy=line[:, 1] * KM, gz=line[:, 2] * KM, line=i)))
+    grid = pd.concat(grid_rows, ignore_index=True)
+    ang = f"(-({th0} + {rate * dt} * tk))" if animated else f"(-{th0})"
+    grid_chart = _project(alt.Chart(grid).mark_circle(size=6, color="#8fb8d4", opacity=0.6), ang).encode(**xy)
+
+    # --- orbit path and frame markers
     times, states = dense_track(data, n_dense)
-    fig = go.Figure(_earth_trace())
-    gx, gy, gz = _graticule_xyz(cfg.earth, 0.0)
-    fig.add_trace(go.Scatter3d(x=gx, y=gy, z=gz, mode="lines", line=dict(color="#7aa6c4", width=1),
-                               hoverinfo="skip", name="Lat/lon grid (t=0)"))
-    fig.add_trace(go.Scatter3d(x=states[:, 0], y=states[:, 1], z=states[:, 2], mode="lines",
-                               line=dict(color="#e8a33d", width=4), name="Orbit"))
+    orbit = pd.DataFrame(dict(x=states[:, 0] * KM, y=states[:, 1] * KM, z=states[:, 2] * KM))
+    orbit_chart = _project(alt.Chart(orbit).mark_circle(size=9, color="#e8a33d"), None).encode(**xy)
     fs = data.truth_states
-    fig.add_trace(go.Scatter3d(
-        x=fs[:, 0], y=fs[:, 1], z=fs[:, 2], mode="markers", name="Frames",
-        marker=dict(size=4, color=data.frame_times, colorscale="Viridis",
-                    colorbar=dict(title="t (s)", len=0.5)),
-        text=[f"frame {k}, t={t:.0f} s" for k, t in enumerate(data.frame_times)], hoverinfo="text"))
-    _scene(fig, "True orbit (ECI)")
-    return fig
+    frames = pd.DataFrame(dict(x=fs[:, 0] * KM, y=fs[:, 1] * KM, z=fs[:, 2] * KM, frame=np.arange(len(fs)),
+                               t=data.frame_times))
+    frame_chart = _project(alt.Chart(frames).mark_circle(size=40, stroke="#0b1620", strokeWidth=0.8), None).encode(
+        color=alt.Color("t:Q", scale=alt.Scale(scheme="viridis"), title="frame time (s)"),
+        tooltip=["frame", alt.Tooltip("t:Q", format=".0f")], **xy)
+    layers = [earth, grid_chart, orbit_chart, frame_chart]
+
+    # --- satellite and camera footprint at the slider time
+    if animated:
+        tk = alt.param(name="tk", value=0, bind=alt.binding_range(min=0, max=n_time - 1, step=1, name="time step "))
+        params.append(tk)
+        ts = np.linspace(0.0, t_end, n_time)
+        sx, _ = Propagator(cfg.truth_force).propagate_many(data.truth_x_epoch, 0.0, ts)
+        sat = pd.DataFrame(dict(x=sx[:, 0] * KM, y=sx[:, 1] * KM, z=sx[:, 2] * KM, k=np.arange(n_time), t=ts))
+        sat_chart = _project(alt.Chart(sat).mark_circle(size=130, color="#ffffff", stroke="#e8a33d", strokeWidth=2)
+                             .transform_filter("datum.k == tk"), None).encode(
+            tooltip=[alt.Tooltip("t:Q", format=".0f", title="t (s)")], **xy)
+        fp_rows = []
+        for k, (t, x) in enumerate(zip(ts, sx)):
+            f = footprint_ecef(cfg, t, x) @ cfg.earth.rotation(t)  # ECEF -> ECI
+            fp_rows.append(pd.DataFrame(dict(x=f[:, 0] * KM, y=f[:, 1] * KM, z=f[:, 2] * KM, k=k,
+                                             order=np.arange(len(f)))))
+        fp = pd.concat(fp_rows, ignore_index=True).dropna()
+        fp_chart = _project(alt.Chart(fp).mark_line(color="#ff6b6b", strokeWidth=2.5)
+                            .transform_filter("datum.k == tk"), None).encode(order="order:Q", **xy)
+        layers += [fp_chart, sat_chart]
+
+    title = ("Orbit animation: drag the sliders to rotate the view and move the satellite"
+             if animated else "True orbit: drag the sliders to rotate the view")
+    chart = (alt.layer(*layers).add_params(*params)
+             .properties(width=SIZE_PX, height=SIZE_PX, title=alt.TitleParams(title, color="#dfe8ee"))
+             .configure_view(fill=_BG, strokeWidth=0)
+             .configure_legend(labelColor="#dfe8ee", titleColor="#dfe8ee"))
+    return chart
 
 
-def animate_orbit(data, n_frames: int = 90) -> go.Figure:
-    """Satellite moving along the orbit, the lat/lon grid rotating with the Earth, and the
-    camera footprint on the ground."""
-    cfg = data.config
-    times, states = dense_track(data, 400)
-    anim_t = np.linspace(0.0, times[-1], n_frames)
-    anim_x, _ = __import__("astroflow.dynamics", fromlist=["Propagator"]).Propagator(cfg.truth_force).propagate_many(
-        data.truth_x_epoch, 0.0, anim_t)
+def plot_orbit_3d(data, n_dense: int = 500) -> alt.LayerChart:
+    """Earth, the true orbit over the observed arc and the satellite at each frame time.
+    Sliders rotate the view (azimuth, elevation). Works without WebGL."""
+    return _build(data, animated=False, n_dense=n_dense, n_time=2)
 
-    def foot_eci(t, x):
-        f = footprint_ecef(cfg, t, x)
-        return f @ cfg.earth.rotation(t)  # ECEF -> ECI (row form of R^T f)
 
-    gx, gy, gz = _graticule_xyz(cfg.earth, 0.0)
-    f0 = foot_eci(anim_t[0], anim_x[0])
-    fig = go.Figure([
-        _earth_trace(),
-        go.Scatter3d(x=states[:, 0], y=states[:, 1], z=states[:, 2], mode="lines",
-                     line=dict(color="#e8a33d", width=3), name="Orbit"),
-        go.Scatter3d(x=gx, y=gy, z=gz, mode="lines", line=dict(color="#7aa6c4", width=1), hoverinfo="skip", name="Grid"),
-        go.Scatter3d(x=[anim_x[0, 0]], y=[anim_x[0, 1]], z=[anim_x[0, 2]], mode="markers",
-                     marker=dict(size=6, color="#ffffff"), name="Satellite"),
-        go.Scatter3d(x=f0[:, 0], y=f0[:, 1], z=f0[:, 2], mode="lines", line=dict(color="#ff6b6b", width=4),
-                     name="Camera footprint"),
-    ])
-    frames = []
-    for t, x in zip(anim_t, anim_x):
-        gx, gy, gz = _graticule_xyz(cfg.earth, t)
-        f = foot_eci(t, x)
-        frames.append(go.Frame(name=f"{t:.0f}", traces=[2, 3, 4], data=[
-            go.Scatter3d(x=gx, y=gy, z=gz),
-            go.Scatter3d(x=[x[0]], y=[x[1]], z=[x[2]]),
-            go.Scatter3d(x=f[:, 0], y=f[:, 1], z=f[:, 2])]))
-    fig.frames = frames
-    fig.update_layout(
-        updatemenus=[dict(type="buttons", showactive=False, x=0.05, y=0.02, buttons=[
-            dict(label="Play", method="animate", args=[None, dict(frame=dict(duration=60, redraw=True), fromcurrent=True)]),
-            dict(label="Pause", method="animate", args=[[None], dict(frame=dict(duration=0), mode="immediate")])])],
-        sliders=[dict(active=0, x=0.2, len=0.75, currentvalue=dict(prefix="t = ", suffix=" s"),
-                      steps=[dict(label=f.name, method="animate",
-                                  args=[[f.name], dict(mode="immediate", frame=dict(duration=0, redraw=True))])
-                             for f in frames])])
-    _scene(fig, "Orbit animation (ECI; grid rotates with the Earth)")
-    return fig
+def animate_orbit(data, n_time: int = 120, n_dense: int = 500) -> alt.LayerChart:
+    """As `plot_orbit_3d`, plus a time slider: the satellite moves along the orbit, the lat/lon
+    grid turns with the Earth, and the camera footprint is shown on the ground."""
+    return _build(data, animated=True, n_dense=n_dense, n_time=n_time)

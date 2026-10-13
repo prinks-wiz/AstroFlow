@@ -24,9 +24,8 @@ print(f"{len(data.frame_times)} frames, {len(data.obs)} points: "
       f"{(~data.is_outlier).sum()} inliers, {data.is_outlier.sum()} outliers "
       f"({data.is_outlier.mean():.0%})")
 
-plot_orbit_3d(data).write_html(out / "orbit_3d.html")
-animate_orbit(data).write_html(out / "orbit_animation.html")
-for name, chart in {"ground_track": plot_ground_track(data), "pixel_tracks": plot_pixel_tracks(data),
+for name, chart in {"orbit_3d": plot_orbit_3d(data), "orbit_animation": animate_orbit(data),
+                    "ground_track": plot_ground_track(data), "pixel_tracks": plot_pixel_tracks(data),
                     "camera_settings": plot_settings_effect()}.items():
     chart.save(out / f"{name}.html")
     chart.save(out / f"{name}.png", scale_factor=2)

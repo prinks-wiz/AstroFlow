@@ -102,13 +102,13 @@ the real unit's specs are known. A later stage will replace the assumed part wit
 
 ```bash
 pip install -e ".[viz]"
-python examples/simulate_demo.py     # writes HTML and PNG files to out/
+python examples/simulate_demo.py     # writes HTML and PNG files to out/ (no WebGL needed)
 ```
 
 | File | Shows |
 |---|---|
-| `orbit_3d.html` | The orbit around the Earth (drag to rotate) |
-| `orbit_animation.html` | The satellite moving, Earth rotating, and the camera footprint |
+| `orbit_3d.html` | The orbit around the Earth; sliders rotate the view |
+| `orbit_animation.html` | Same, plus a time slider: satellite moving, Earth turning, camera footprint |
 | `ground_track.html` | Track on a world map, footprints, matched landmarks (inliers teal, outliers red) |
 | `pixel_tracks.html` | Where matches land in the image; drag to highlight points |
 | `camera_settings.html` | How exposure, gain and white balance change match quality (under the assumed model) |

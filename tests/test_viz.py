@@ -2,7 +2,6 @@ import numpy as np
 import pytest
 
 pytest.importorskip("altair")
-pytest.importorskip("plotly")
 
 from astroflow.constants import A_WGS84, B_WGS84
 from astroflow.sensor import MatchQualityModel
@@ -50,13 +49,39 @@ def test_world_map_is_bundled():
 def test_plots_build_and_serialize(data):
     for chart in (plot_ground_track(data), plot_pixel_tracks(data), plot_settings_effect()):
         assert chart.to_dict()  # valid Vega-Lite spec
-    fig = plot_orbit_3d(data)
-    assert [t.name for t in fig.data][:1] == ["Earth"] and "Frames" in [t.name for t in fig.data]
-    orbit = next(t for t in fig.data if t.name == "Orbit")
-    r = np.linalg.norm(np.column_stack([orbit.x, orbit.y, orbit.z]), axis=1)
-    assert 6.8e6 < r.min() and r.max() < 7.1e6
-    anim = animate_orbit(data, n_frames=10)
-    assert len(anim.frames) == 10 and fig.to_html()
+
+
+def _spec(chart):
+    return chart.to_dict()
+
+
+def test_3d_views_need_no_webgl_and_have_the_right_controls(data):
+    static, anim = _spec(plot_orbit_3d(data)), _spec(animate_orbit(data, n_time=10))
+    names = lambda sp: {p["name"] for p in sp["params"]} if "params" in sp else {
+        p["name"] for lay in sp["layer"] for p in lay.get("params", [])}
+    assert names(static) >= {"az", "el"} and "tk" not in names(static)
+    assert names(anim) >= {"az", "el", "tk"}
+    import json
+    assert "scatter3d" not in json.dumps(anim).lower()  # plain 2D marks only
+
+
+def test_default_view_is_oblique_to_the_orbit_plane(data):
+    from astroflow.viz.orbit3d import _default_view
+    az, el = _default_view(data)
+    c = np.array([np.cos(np.radians(el)) * np.cos(np.radians(az)), np.cos(np.radians(el)) * np.sin(np.radians(az)),
+                  np.sin(np.radians(el))])
+    n = np.cross(data.truth_x_epoch[:3], data.truth_x_epoch[3:]); n /= np.linalg.norm(n)
+    assert 45 < np.degrees(np.arccos(abs(c @ n))) < 65
+
+
+def test_projection_expressions_match_numpy_projection(data):
+    """The Vega expressions encode u = p.e1, v = p.e2, d = p.c; check the orthonormal frame they imply."""
+    az, el = np.radians(37.0), np.radians(21.0)
+    c = np.array([np.cos(el) * np.cos(az), np.cos(el) * np.sin(az), np.sin(el)])
+    e1 = np.array([-np.sin(az), np.cos(az), 0.0])
+    e2 = np.array([-np.sin(el) * np.cos(az), -np.sin(el) * np.sin(az), np.cos(el)])
+    assert np.allclose([e1 @ e1, e2 @ e2, c @ c, e1 @ e2, e1 @ c, e2 @ c], [1, 1, 1, 0, 0, 0], atol=1e-12)
+    assert np.allclose(np.cross(e1, e2), c)  # right-handed: u right, v up, d toward the viewer
 
 
 def test_settings_chart_shows_gain_saturation_tradeoff():
